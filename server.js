@@ -1,88 +1,78 @@
-// server.js
-// Backend for Shopify + PayPal (Capture) with multi-origin CORS
-// Node >= 18 (أو استخدم node-fetch كما هنا)
+// server.js — PayPal (Live/Sandbox) + Shopify Draft→Complete
+// Node 18+ (أو أضف node-fetch إذا لزم)، Express, CORS, Helmet
 
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
-import fetch from "node-fetch";
+import fetch from "node-fetch"; // إن كنت على Node <18
 
 const app = express();
-
-// ───────────── Middlewares ─────────────
 app.use(helmet());
 app.use(express.json({ limit: "1mb" }));
 
-// ───────────── Env Vars ─────────────
-// ملاحظة: لا تضع أسرار داخل الكود. كل شيء من الـ .env / Render env.
+// ---------- CORS ----------
+function parseAllowedOrigin(val) {
+  if (!val || val === "*") return "*";
+  // يدعم قائمة مفصولة بفواصل
+  const arr = val.split(",").map(s => s.trim()).filter(Boolean);
+  return arr.length ? arr : "*";
+}
+const ALLOWED_ORIGIN_RAW = process.env.ALLOWED_ORIGIN || "*";
+// ملاحظة: Shopify customizer يأتي من *.myshopify.com، إن أردت تحديدًا أضفه هنا بيئياً.
+const corsOrigin = parseAllowedOrigin(ALLOWED_ORIGIN_RAW);
+app.use(cors({
+  origin: corsOrigin,
+  credentials: false
+}));
+
+// ---------- ENV ----------
 const {
   PAYPAL_CLIENT_ID,
   PAYPAL_CLIENT_SECRET,
-  PAYPAL_ENV = "live", // live | sandbox
-  SHOPIFY_STORE,       // مثال: "laicea" بدون .myshopify.com
+  PAYPAL_ENV = "live",           // "live" أو "sandbox"
+  SHOPIFY_STORE,                 // مثال: "iptcy7-up" (بدون .myshopify.com)
   SHOPIFY_ADMIN_TOKEN,
-  SHOPIFY_API_VERSION = "2025-10",
-  ALLOWED_ORIGIN = "*" // أمثلة: "https://www.laicea.com,https://laicea.com,https://XXXX.myshopify.com"
+  SHOPIFY_API_VERSION = "2025-10"
 } = process.env;
 
 if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
-  console.warn("⚠️ Missing PayPal credentials (PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET)");
+  console.warn("⚠️ Missing PayPal credentials (PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET).");
 }
 if (!SHOPIFY_STORE || !SHOPIFY_ADMIN_TOKEN) {
-  console.warn("⚠️ Missing Shopify credentials (SHOPIFY_STORE / SHOPIFY_ADMIN_TOKEN)");
+  console.warn("⚠️ Missing Shopify credentials (SHOPIFY_STORE / SHOPIFY_ADMIN_TOKEN).");
 }
 
-// PayPal base URL
-const PP_BASE =
-  PAYPAL_ENV === "sandbox"
-    ? "https://api-m.sandbox.paypal.com"
-    : "https://api-m.paypal.com";
+const PP_BASE = PAYPAL_ENV === "sandbox"
+  ? "https://api-m.sandbox.paypal.com"
+  : "https://api-m.paypal.com";
 
-// Shopify Admin GraphQL endpoint
 const SHOP_ADMIN = `https://${SHOPIFY_STORE}.myshopify.com/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
 
-// ───────────── CORS (متعدد الدومينات) ─────────────
-const ORIGINS =
-  ALLOWED_ORIGIN === "*"
-    ? "*"
-    : ALLOWED_ORIGIN.split(",").map(s => s.trim()).filter(Boolean);
+// ---------- Helpers ----------
+function to2(v) {
+  // يحول أي رقم/نص لعدد عشري بدقة 2 (كسلسلة)
+  const n = typeof v === "number" ? v : parseFloat(String(v || "0").replace(/,/g, ""));
+  if (isNaN(n)) return "0.00";
+  return n.toFixed(2);
+}
 
-const corsOptions =
-  ORIGINS === "*"
-    ? { origin: true }
-    : {
-        origin: (origin, cb) => {
-          // السماح لطلبات السيرفر نفسه (fetch بدون origin) أو أي دومين ضمن القائمة
-          if (!origin || ORIGINS.includes(origin)) return cb(null, true);
-          return cb(new Error("Not allowed by CORS: " + origin));
-        },
-        methods: ["GET", "POST", "OPTIONS"],
-        allowedHeaders: ["Content-Type", "Authorization"]
-      };
+function sum2(vals) {
+  // يجمع قائمة أرقام (كسلاسل أو أرقام) ويعيد نص بدقة 2
+  const s = (vals || []).reduce((acc, x) => acc + (parseFloat(x) || 0), 0);
+  return s.toFixed(2);
+}
 
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions)); // preflight
-
-// ───────────── Helpers ─────────────
 async function paypalAccessToken() {
   const res = await fetch(`${PP_BASE}/v1/oauth2/token`, {
     method: "POST",
     headers: {
-      Authorization:
-        "Basic " +
-        Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString(
-          "base64"
-        ),
+      "Authorization": "Basic " + Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString("base64"),
       "Content-Type": "application/x-www-form-urlencoded"
     },
     body: "grant_type=client_credentials"
   });
   const data = await res.json();
-  if (!res.ok) {
-    throw new Error(
-      `PayPal OAuth failed: ${res.status} ${JSON.stringify(data)}`
-    );
-  }
+  if (!res.ok) throw new Error(`PayPal OAuth failed: ${res.status} ${JSON.stringify(data)}`);
   return data.access_token;
 }
 
@@ -102,122 +92,138 @@ async function shopifyGraphQL(query, variables = {}) {
   return j.data;
 }
 
-const toVariantGID = id => `gid://shopify/ProductVariant/${id}`;
+const toVariantGID = (id) => `gid://shopify/ProductVariant/${id}`;
 
-// ───────────── Routes ─────────────
-
-// 1) Generate PayPal client token (لـ Hosted Fields أو wallet gated)
+// ---------- PayPal: Client Token ----------
 app.post("/api/paypal/client-token", async (_req, res) => {
   try {
-    const access = await paypalAccessToken();
+    const token = await paypalAccessToken();
     const r = await fetch(`${PP_BASE}/v1/identity/generate-token`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${access}`,
+        "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json"
       }
     });
     const j = await r.json();
     if (!r.ok || !j?.client_token) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Failed to generate client token", details: j });
+      return res.status(400).json({ ok: false, error: "Failed to generate client token", details: j });
     }
     res.json({ ok: true, client_token: j.client_token });
   } catch (e) {
-    console.error("❌ /client-token:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// 2) Create PayPal Order (لما تستخدم Hosted Fields)
+// ---------- PayPal: Create Order ----------
 app.post("/api/paypal/create-order", async (req, res) => {
   try {
-    const { value, currency = "USD" } = req.body || {};
-    if (!value) return res.status(400).json({ ok: false, error: "Missing amount value" });
+    const b = req.body || {};
+    const currency = b.currency || "USD";
 
-    const access = await paypalAccessToken();
+    // نتوقع payload من الواجهة:
+    // { items:[{title, quantity, price}], shipping:{label, price}, total, currency }
+    const items = Array.isArray(b.items) ? b.items : [];
+    const shippingPrice = to2(b?.shipping?.price || "0");
+    const itemsTotal = sum2(items.map(it => (parseFloat(it.price) || 0) * (parseInt(it.quantity,10) || 0)));
+    const total = to2(parseFloat(itemsTotal) + parseFloat(shippingPrice));
+
+    // لو المجموع القادم من الواجهة (b.total) موجود وتعارض مع حسابنا، نستخدم حسابنا لتفادي MISMATCH
+    const finalTotal = to2(b.total || total);
+
+    // breakdown
+    const body = {
+      intent: "CAPTURE",
+      purchase_units: [{
+        amount: {
+          currency_code: currency,
+          value: finalTotal,
+          breakdown: {
+            item_total: {
+              currency_code: currency,
+              value: to2(itemsTotal)
+            },
+            shipping: {
+              currency_code: currency,
+              value: shippingPrice
+            }
+          }
+        },
+        items: items.map(it => ({
+          name: String(it.title || "Item"),
+          quantity: String(parseInt(it.quantity,10) || 1),
+          unit_amount: {
+            currency_code: currency,
+            value: to2(it.price || "0")
+          }
+        }))
+      }],
+      application_context: {
+        user_action: "PAY_NOW"
+      }
+    };
+
+    const token = await paypalAccessToken();
     const r = await fetch(`${PP_BASE}/v2/checkout/orders`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${access}`,
+        "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        intent: "CAPTURE",
-        purchase_units: [{ amount: { currency_code: currency, value: value } }]
-      })
+      body: JSON.stringify(body)
     });
+
     const j = await r.json();
     if (!r.ok) {
-      return res
-        .status(r.status)
-        .json({ ok: false, error: "PayPal create order failed", details: j });
+      return res.status(r.status).json({ ok: false, error: "PayPal create order failed", details: j, sent: body });
     }
     res.json({ ok: true, orderID: j.id });
   } catch (e) {
-    console.error("❌ /create-order:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// 3) Capture PayPal Order (لـ buttons أو بعد Hosted Fields submit)
+// ---------- PayPal: Capture ----------
 app.post("/api/paypal/capture", async (req, res) => {
   try {
     const { paypalOrderId } = req.body || {};
-    if (!paypalOrderId)
-      return res.status(400).json({ ok: false, error: "Missing paypalOrderId" });
+    if (!paypalOrderId) return res.status(400).json({ ok: false, error: "Missing paypalOrderId" });
 
-    const access = await paypalAccessToken();
-    const capRes = await fetch(
-      `${PP_BASE}/v2/checkout/orders/${paypalOrderId}/capture`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${access}`,
-          "Content-Type": "application/json"
-        }
+    const token = await paypalAccessToken();
+    const capRes = await fetch(`${PP_BASE}/v2/checkout/orders/${paypalOrderId}/capture`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
       }
-    );
+    });
     const cap = await capRes.json();
     if (!capRes.ok) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "PayPal capture failed", details: cap });
+      return res.status(400).json({ ok: false, error: "PayPal capture failed", details: cap });
     }
 
-    const status =
-      cap?.status ||
-      cap?.purchase_units?.[0]?.payments?.captures?.[0]?.status;
+    const status = cap?.status || cap?.purchase_units?.[0]?.payments?.captures?.[0]?.status;
     if (status !== "COMPLETED") {
-      return res.status(400).json({
-        ok: false,
-        error: `Unexpected PayPal status: ${status || "unknown"}`,
-        details: cap
-      });
+      return res.status(400).json({ ok: false, error: `Unexpected PayPal status: ${status || "unknown"}`, details: cap });
     }
 
+    // محاولة استخراج العنوان والبريد
     const pu = cap?.purchase_units?.[0] || {};
     const ship = pu?.shipping?.address || {};
-    const name = pu?.shipping?.name?.full_name || "";
+    const fullName = pu?.shipping?.name?.full_name || "";
     const payer = cap?.payer || {};
-    const [given_name, ...rest] = (
-      name ||
-      `${payer?.name?.given_name || ""} ${payer?.name?.surname || ""}`
-    )
-      .trim()
-      .split(" ");
+    const [given_name, ...rest] = (fullName || `${payer?.name?.given_name || ""} ${payer?.name?.surname || ""}`).trim().split(" ");
     const surname = rest.join(" ").trim();
 
     const address = {
       firstName: given_name || payer?.name?.given_name || "",
-      lastName: surname || payer?.name?.surname || "",
-      address1: ship?.address_line_1 || "",
-      city: ship?.admin_area_2 || "",
-      zip: ship?.postal_code || "",
-      country: ship?.country_code || "",
-      phone: "",
-      email: payer?.email_address || ""
+      lastName:  surname   || payer?.name?.surname    || "",
+      address1:  ship?.address_line_1 || "",
+      city:      ship?.admin_area_2   || "",
+      zip:       ship?.postal_code    || "",
+      country:   ship?.country_code   || "",
+      phone:     "",
+      email:     payer?.email_address || ""   // البريد يُستخدم على مستوى الطلب DraftOrderInput.email فقط
     };
 
     const captureId =
@@ -227,32 +233,47 @@ app.post("/api/paypal/capture", async (req, res) => {
 
     res.json({ ok: true, captureId, address, raw: cap });
   } catch (e) {
-    console.error("❌ /capture:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// 4) Create Shopify Order (Draft -> Complete) بعد نجاح الدفع
+// ---------- Shopify: Draft Order → Complete ----------
 app.post("/api/shopify/order-from-paypal", async (req, res) => {
   try {
     const b = req.body || {};
+    // نتوقع بنية:
+    // {
+    //   items: [{ variant_id, quantity }],
+    //   address: { firstName,lastName,address1,city,zip,country,phone?,email? },
+    //   shipping: { label, price },
+    //   paypalOrderId, paypalCaptureId
+    // }
+
     const errs = [];
-
-    // التحقق من الحقول المطلوبة
-    if (!Array.isArray(b.line_items) || b.line_items.length === 0)
-      errs.push("line_items is required");
-
+    if (!Array.isArray(b.items) || b.items.length === 0) errs.push("items[] is required");
     const A = b.address || {};
-    ["firstName", "lastName", "address1", "city", "zip", "country"].forEach(k => {
-      if (!A[k]) errs.push(`address.${k} is required`);
-    });
-
-    if (!b.shipping_label) errs.push("shipping_label is required");
-    if (b.shipping_price == null) errs.push("shipping_price is required");
-
+    ["firstName","lastName","address1","city","zip","country"].forEach(k => { if (!A[k]) errs.push(`address.${k} is required`); });
+    if (!b.shipping || typeof b.shipping.price === "undefined") errs.push("shipping.price is required");
     if (errs.length) return res.status(400).json({ ok: false, error: "Invalid payload", details: errs });
 
-    // بناء مدخل الدرفـت
+    // عنوان الفوترة/الشحن — بدون email (MailingAddressInput لا يحتوي email)
+    const billingAddress = {
+      firstName: A.firstName,
+      lastName:  A.lastName,
+      address1:  A.address1,
+      city:      A.city,
+      zip:       A.zip,
+      country:   A.country,
+      phone:     A.phone || null
+    };
+    const shippingAddress = { ...billingAddress };
+
+    const lineItems = b.items.map(li => ({
+      variantId: toVariantGID(li.variant_id),
+      quantity: parseInt(li.quantity, 10) || 1
+      // price: يمكن تركه فارغًا ليستخدم Shopify سعر المتجر تلقائيًا
+    }));
+
     const draftOrderCreate = `
       mutation draftOrderCreate($input: DraftOrderInput!) {
         draftOrderCreate(input: $input) {
@@ -263,47 +284,22 @@ app.post("/api/shopify/order-from-paypal", async (req, res) => {
     `;
 
     const draftInput = {
-      email: A.email || undefined, // الإيميل العام على مستوى الطلب
-      billingAddress: {
-        firstName: A.firstName,
-        lastName: A.lastName,
-        address1: A.address1,
-        city: A.city,
-        zip: A.zip,
-        country: A.country,
-        phone: A.phone || null
-      },
-      shippingAddress: {
-        firstName: A.firstName,
-        lastName: A.lastName,
-        address1: A.address1,
-        city: A.city,
-        zip: A.zip,
-        country: A.country,
-        phone: A.phone || null
-      },
-      lineItems: b.line_items.map(li => ({
-        variantId: toVariantGID(li.variant_id),
-        quantity: parseInt(li.quantity, 10),
-        // price (اختياري): إذا بدك تفرض سعر مختلف، وإلا Shopify بيحسب من المتجر
-        price: li.price ? String(li.price) : null
-      })),
-      shippingLine:
-        b.shipping_price !== "" && b.shipping_price != null
-          ? {
-              title: b.shipping_label || "Shipping",
-              price: String(b.shipping_price)
-            }
-          : null,
+      email: A.email || undefined,       // البريد يوضع هنا فقط
+      billingAddress,
+      shippingAddress,
+      lineItems,
+      // إضافة سطر شحن إن كان > 0
+      shippingLine: (b.shipping && b.shipping.price && parseFloat(b.shipping.price) > 0)
+        ? { title: (b.shipping.label || "Shipping"), price: to2(b.shipping.price) }
+        : null,
       note: `PayPal order ${b.paypalOrderId || ""} | capture ${b.paypalCaptureId || ""}`.trim()
     };
 
     const d1 = await shopifyGraphQL(draftOrderCreate, { input: draftInput });
     const ue1 = d1?.draftOrderCreate?.userErrors || [];
     if (ue1.length) {
-      return res.status(400).json({ ok: false, error: "Shopify user errors", details: ue1 });
+      return res.status(400).json({ ok: false, error: "Shopify user errors (create)", details: ue1 });
     }
-
     const draftId = d1?.draftOrderCreate?.draftOrder?.id;
     if (!draftId) {
       return res.status(400).json({ ok: false, error: "Failed to create draft order", details: d1 });
@@ -317,13 +313,11 @@ app.post("/api/shopify/order-from-paypal", async (req, res) => {
         }
       }
     `;
-
     const d2 = await shopifyGraphQL(draftOrderComplete, { id: draftId });
     const ue2 = d2?.draftOrderComplete?.userErrors || [];
     if (ue2.length) {
-      return res.status(400).json({ ok: false, error: "Shopify user errors", details: ue2 });
+      return res.status(400).json({ ok: false, error: "Shopify user errors (complete)", details: ue2 });
     }
-
     const orderNode = d2?.draftOrderComplete?.draftOrder?.order;
     if (!orderNode?.id) {
       return res.status(400).json({ ok: false, error: "Unable to complete draft order", details: d2 });
@@ -331,21 +325,13 @@ app.post("/api/shopify/order-from-paypal", async (req, res) => {
 
     res.json({ ok: true, order: orderNode });
   } catch (e) {
-    console.error("❌ /order-from-paypal:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// 5) Health check
+// ---------- Health ----------
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-// ───────────── Start ─────────────
+// ---------- Start ----------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ API listening on :${PORT}`);
-  if (ORIGINS === "*") {
-    console.log("🌍 CORS: * (all origins allowed)");
-  } else {
-    console.log("🌍 CORS allowed origins:", ORIGINS);
-  }
-});
+app.listen(PORT, () => console.log(`✅ API listening on :${PORT}`));
