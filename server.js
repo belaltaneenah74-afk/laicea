@@ -11,19 +11,25 @@ app.use(helmet());
 app.use(express.json({ limit: "1mb" }));
 
 // ---------- CORS ----------
-function parseAllowedOrigin(val) {
-  if (!val || val === "*") return "*";
-  // يدعم قائمة مفصولة بفواصل
-  const arr = val.split(",").map(s => s.trim()).filter(Boolean);
-  return arr.length ? arr : "*";
-}
-const ALLOWED_ORIGIN_RAW = process.env.ALLOWED_ORIGIN || "*";
-// ملاحظة: Shopify customizer يأتي من *.myshopify.com، إن أردت تحديدًا أضفه هنا بيئياً.
-const corsOrigin = parseAllowedOrigin(ALLOWED_ORIGIN_RAW);
-app.use(cors({
-  origin: corsOrigin,
-  credentials: false
-}));
+// CORS - يدعم قائمة دومينات مفصولة بفواصل
+const raw = process.env.ALLOWED_ORIGIN || "*";
+// أمثلة مسموح بها: "https://www.laicea.com,https://laicea.com,https://6b0a70-66.myshopify.com"
+const ORIGINS = raw === "*" 
+  ? "*" 
+  : raw.split(",").map(s => s.trim()).filter(Boolean);
+
+const corsOptions = ORIGINS === "*" ? { origin: true } : {
+  origin: (origin, cb) => {
+    // السماح للطلبات من السيرفر نفسه (no origin) أو أي دومين ضمن القائمة
+    if (!origin || ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error("Not allowed by CORS: " + origin));
+  },
+  methods: ["GET","POST","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization"]
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // للتعامل مع preflight
 
 // ---------- ENV ----------
 const {
