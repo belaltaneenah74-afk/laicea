@@ -1,4 +1,5 @@
-// server.js - نهائي مع دعم خصومات البندل
+// server.js - نهائي مع دعم خصومات البندل + مسارين للـ endpoint
+
 const express = require('express');
 const cors = require('cors');
 
@@ -6,7 +7,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ندعم أكثر من اسم لمتغيرات البيئة عشان ما نخرب إعداداتك القديمة
+// متغيرات البيئة (ندعم أكثر من اسم عشان ما نخرب إعداداتك)
 const SHOPIFY_STORE =
   process.env.SHOPIFY_STORE ||
   process.env.SHOPIFY_STORE_DOMAIN ||
@@ -45,26 +46,13 @@ async function shopifyRequest(path, options = {}) {
   return json;
 }
 
-// فحص صحة السيرفر
+// فحص السيرفر
 app.get('/', (_req, res) => {
   res.json({ ok: true, msg: 'PayPal → Shopify bridge running' });
 });
 
-/**
- * POST /api/shopify/order-from-paypal
- * body:
- * {
- *   paypalOrderId,
- *   paypalCaptureId,
- *   address: { firstName, lastName, address1, city, zip, country, email, phone },
- *   shipping_label,
- *   shipping_price,
- *   line_items: [
- *     { variant_id, quantity, price }   // price = سعر الوحدة بعد الخصم (مثلاً 2.00)
- *   ]
- * }
- */
-app.post('/api/shopify/order-from-paypal', async (req, res) => {
+// 🧠 هاندلر مشترك للمسارين
+async function handleOrderFromPaypal(req, res) {
   try {
     const {
       paypalOrderId,
@@ -79,7 +67,7 @@ app.post('/api/shopify/order-from-paypal', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Missing line_items' });
     }
 
-    // ✅ نحضّر line_items للدرافـت أوردر مع سعر الوحدة المخصّص (بعد الخصم)
+    // ✅ نستخدم السعر المرسل من التشيك أوت (بعد الخصم / البندل)
     const draftLineItems = line_items.map(li => {
       const qty = li.quantity || 1;
       const out = {
@@ -89,13 +77,13 @@ app.post('/api/shopify/order-from-paypal', async (req, res) => {
       if (li.price != null) {
         const p = Number(li.price);
         if (!Number.isNaN(p)) {
-          out.price = p.toFixed(2);
+          out.price = p.toFixed(2); // سعر الوحدة النهائي
         }
       }
       return out;
     });
 
-    // 🔹 العناوين
+    // العناوين
     let shipping_address;
     let billing_address;
     let orderEmail = DEFAULT_ORDER_EMAIL;
@@ -115,7 +103,7 @@ app.post('/api/shopify/order-from-paypal', async (req, res) => {
       if (address.email) orderEmail = address.email;
     }
 
-    // 🔹 الشحن في الدرافـت أوردر
+    // خط الشحن
     let shippingLine = undefined;
     const shipNum = Number(shipping_price);
     if (!Number.isNaN(shipNum) && shipNum > 0) {
@@ -125,7 +113,7 @@ app.post('/api/shopify/order-from-paypal', async (req, res) => {
       };
     }
 
-    // 🧾 نبني الدرافـت أوردر
+    // 🧾 نبني Draft Order
     const draftPayload = {
       draft_order: {
         email: orderEmail,
@@ -139,7 +127,7 @@ app.post('/api/shopify/order-from-paypal', async (req, res) => {
       }
     };
 
-    // 1) نُنشئ Draft Order
+    // 1) إنشاء Draft Order
     const draft = await shopifyRequest('/draft_orders.json', {
       method: 'POST',
       body: JSON.stringify(draftPayload)
@@ -151,10 +139,10 @@ app.post('/api/shopify/order-from-paypal', async (req, res) => {
 
     const draftId = draft.draft_order.id;
 
-    // 2) نكمّل الدرافـت أوردر إلى Order حقيقي (مدفوع)
+    // 2) تحويله إلى Order مدفوع
     const completed = await shopifyRequest(`/draft_orders/${draftId}/complete.json`, {
       method: 'PUT',
-      body: JSON.stringify({ payment_pending: false }) // مدفوع بالفعل عبر بايبال
+      body: JSON.stringify({ payment_pending: false })
     });
 
     const order = completed.order || completed;
@@ -175,7 +163,11 @@ app.post('/api/shopify/order-from-paypal', async (req, res) => {
       detail: err.message
     });
   }
-});
+}
+
+// 🔗 ندعم المسارين القديم والجديد
+app.post('/order-from-paypal', handleOrderFromPaypal);
+app.post('/api/shopify/order-from-paypal', handleOrderFromPaypal);
 
 // تشغيل السيرفر
 const PORT = process.env.PORT || 3000;
