@@ -1,6 +1,6 @@
 // server.js
 // ===============================
-// Express server لاستقبال طلبات PayPal
+// Express server لاستقبال بيانات PayPal
 // وإنشاء طلب مدفوع Paid في Shopify بنفس المبلغ
 // ===============================
 
@@ -10,22 +10,19 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 // إعدادات Shopify من متغيرات البيئة
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE;              // مثال:  myshop.myshopify.com
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE;              // مثال: myshop.myshopify.com
 const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2023-10";
 
 if (!SHOPIFY_STORE || !SHOPIFY_ACCESS_TOKEN) {
-  console.warn(
-    "⚠️  SHOPIFY_STORE أو SHOPIFY_ACCESS_TOKEN غير موجودين في متغيرات البيئة!"
-  );
+  console.warn("⚠️  SHOPIFY_STORE أو SHOPIFY_ACCESS_TOKEN غير موجودين في متغيرات البيئة!");
 }
 
 // --------------------
-// Middleware عام
+// Middleware
 // --------------------
 app.use(express.json());
 
-// CORS بسيط عشان Shopify page تقدر تكلم Render
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
@@ -35,7 +32,7 @@ app.use((req, res, next) => {
 });
 
 // --------------------
-// دالة مساعدة: إنشاء أوردر في Shopify
+// دالة: إنشاء Order في Shopify
 // --------------------
 async function createShopifyOrder(orderPayload) {
   const url = `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/orders.json`;
@@ -52,11 +49,7 @@ async function createShopifyOrder(orderPayload) {
 
   const text = await resp.text();
   let data;
-  try {
-    data = JSON.parse(text);
-  } catch (e) {
-    data = {};
-  }
+  try { data = JSON.parse(text); } catch (e) { data = {}; }
 
   if (!resp.ok || !data.order) {
     const msg = data.errors
@@ -70,7 +63,7 @@ async function createShopifyOrder(orderPayload) {
 }
 
 // --------------------
-// دالة مساعدة: بناء Payload الأوردر من Body الريكوست
+// بناء payload من جسم الطلب
 // --------------------
 function buildOrderFromBody(body) {
   const {
@@ -97,70 +90,21 @@ function buildOrderFromBody(body) {
   }
 
   const shipPrice = parseFloat(shipping_price || "0") || 0;
-  const desiredSubtotal = +(total - shipPrice).toFixed(2);
 
-  // نحضّر البنود اللي جاية من الفرونت
-  const items = line_items.map((li) => ({
-    variant_id: li.variant_id,
-    quantity: li.quantity,
-    price: li.price != null ? parseFloat(li.price) : null, // price = سعر الوحدة (اختياري)
-  }));
-
-  const haveCustomPrices = items.some((it) => it.price != null);
-
-  let lineItemsPayload;
-
-  if (haveCustomPrices) {
-    // لو جايينا أسعار من الـ Checkout → نستخدمها ونضبطها إذا الفروقات بسيطة
-    let currentSubtotal = items.reduce(
-      (s, it) => s + (it.price || 0) * (it.quantity || 0),
-      0
-    );
-
-    currentSubtotal = +currentSubtotal.toFixed(2);
-
-    if (
-      desiredSubtotal > 0 &&
-      Math.abs(currentSubtotal - desiredSubtotal) > 0.02
-    ) {
-      // اختلاف بسيط → نوزع الفرق نسبة وتناسب
-      let running = 0;
-      lineItemsPayload = items.map((it, idx) => {
-        const baseLine = (it.price || 0) * (it.quantity || 0);
-        const share =
-          currentSubtotal > 0 ? baseLine / currentSubtotal : 1 / items.length;
-
-        let newLine;
-        if (idx < items.length - 1) {
-          newLine = +(desiredSubtotal * share).toFixed(2);
-          running += newLine;
-        } else {
-          newLine = +(desiredSubtotal - running).toFixed(2);
-        }
-
-        const unit = +(newLine / (it.quantity || 1)).toFixed(2);
-
-        return {
-          variant_id: it.variant_id,
-          quantity: it.quantity,
-          price: unit.toFixed(2), // 👈 هذا اللي Shopify بيستخدمه كسعر الوحدة
-        };
-      });
-    } else {
-      // ما في فرق كبير → استخدم الأسعار كما هي
-      lineItemsPayload = items.map((it) => ({
-        variant_id: it.variant_id,
-        quantity: it.quantity,
-        price: (it.price || 0).toFixed(2),
-      }));
+  // 👇 نستخدم price المرسَل من صفحة التشيك أوت (بعد الخصم / البندل)
+  const lineItemsPayload = line_items.map((li) => {
+    const out = {
+      variant_id: li.variant_id,
+      quantity: li.quantity,
+    };
+    if (li.price != null) {
+      const p = parseFloat(li.price);
+      if (isFinite(p) && p >= 0) {
+        out.price = p.toFixed(2); // سعر الوحدة
+      }
     }
-  } else {
-    // ما في prices → خلّي Shopify يستخدم أسعار المتغيرات الافتراضية
-    lineItemsPayload = items.map((it) => ({
-      variant_id: it.variant_id,
-      quantity: it.quantity,
-    }));
-  }
+    return out;
+  });
 
   const email = address && address.email;
 
@@ -219,7 +163,7 @@ function buildOrderFromBody(body) {
 }
 
 // --------------------
-// الراوت الرئيسي: نستخدمه مع التشيك أوت الجديد
+// الراوت: يُستخدم من صفحة التشيك أوت
 // --------------------
 app.post(
   ["/api/shopify/order-from-paypal-fixed", "/api/shopify/order-from-paypal"],
@@ -247,12 +191,11 @@ app.post(
   }
 );
 
-// Health check بسيط
+// Health check
 app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
-// Start
 app.listen(PORT, () => {
   console.log("✅ Server listening on port", PORT);
 });
