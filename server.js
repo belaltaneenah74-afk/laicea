@@ -1,130 +1,124 @@
 // server.js
-require('dotenv').config();
+// Simple PayPal → Shopify bridge (DraftOrder + Complete) مع أسعار مخصّصة لكل بند
+
 const express = require('express');
 const cors = require('cors');
 
 const app = express();
 
-// إعدادات أساسية
+// 🛡 السماح للمتاجر تطلب من السيرفر
 app.use(cors());
 app.use(express.json());
 
-// من الـ .env
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE; // مثال: "laicea"
-const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN; // Admin API Token
+// 🧩 متغيرات البيئة (تضبطها من لوحة Render)
+const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP; // مثال: my-store.myshopify.com
+const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2024-04';
+const SHOPIFY_CURRENCY = process.env.SHOPIFY_CURRENCY || 'USD'; // مثال: USD أو EUR
 
-if (!SHOPIFY_STORE || !SHOPIFY_ACCESS_TOKEN) {
-  console.warn('⚠️ Missing SHOPIFY_STORE or SHOPIFY_ACCESS_TOKEN in environment!');
+if (!SHOPIFY_SHOP || !SHOPIFY_ACCESS_TOKEN) {
+  console.error('❌ Missing SHOPIFY_SHOP or SHOPIFY_ACCESS_TOKEN env vars');
 }
 
-// Shopify GraphQL endpoint
-const SHOPIFY_ADMIN_URL = `https://${SHOPIFY_STORE}.myshopify.com/admin/api/2024-04/graphql.json`;
-
-// دالة مساعدة لطلب GraphQL من Shopify
+// 🧠 دالة لاستدعاء Shopify GraphQL
 async function shopifyGraphQL(query, variables = {}) {
-  const res = await fetch(SHOPIFY_ADMIN_URL, {
+  const url = `https://${SHOPIFY_SHOP}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+
+  const res = await fetch(url, {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
       'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
     },
-    body: JSON.stringify({ query, variables }),
+    body: JSON.stringify({ query, variables })
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Shopify HTTP ${res.status}: ${text}`);
-  }
-
   const json = await res.json();
-  if (json.errors) {
-    console.error('Shopify top-level errors:', JSON.stringify(json.errors, null, 2));
-    throw new Error('Shopify GraphQL top-level error');
+  if (!res.ok || json.errors) {
+    console.error('❌ Shopify GraphQL HTTP/Errors:', res.status, json.errors);
+    throw new Error('Shopify GraphQL request failed');
   }
   return json.data;
 }
 
-// 🧪 Health check
+// ✅ هيلث تشِك بسيط
 app.get('/', (req, res) => {
-  res.send('PayPal → Shopify bridge is running ✅');
+  res.json({ ok: true, msg: 'PayPal → Shopify bridge running' });
 });
 
-// 🔐 المسار الرئيسي لإنشاء أوردر Shopify بعد نجاح الدفع من PayPal
+// 🔥 إنشاء DraftOrder + تحويله إلى Order
 app.post('/api/shopify/order-from-paypal', async (req, res) => {
   try {
     const payload = req.body || {};
+    console.log('📥 Incoming payload:', JSON.stringify(payload, null, 2));
 
     const {
-      paypalOrderId,
-      paypalCaptureId,
-      address,
-      shipping_label,
+      line_items = [],
       shipping_price,
-      line_items,
+      shipping_label,
+      address = {},
+      paypalOrderId,
+      paypalCaptureId
     } = payload;
 
-    if (!line_items || !Array.isArray(line_items) || line_items.length === 0) {
+    if (!Array.isArray(line_items) || line_items.length === 0) {
       return res.status(400).json({ ok: false, error: 'Missing line_items' });
     }
 
-    // ✅ نقرأ line_items كما جاءت من صفحة Checkout
-    // كل عنصر: { variant_id, quantity, price }
-    const lineItemsInput = line_items.map((li) => {
-      if (!li.variant_id || !li.quantity) {
-        throw new Error('Invalid line item in payload');
-      }
+    // 🧮 تجهيز البنود مع سعر الوحدة المخصّص (unit_price) إن وجد
+    const gqlLineItems = line_items.map((li) => {
+      const qty = parseInt(li.quantity, 10) || 1;
+      const variantGid = `gid://shopify/ProductVariant/${li.variant_id}`;
 
-      const base = {
-        variantId: `gid://shopify/ProductVariant/${li.variant_id}`,
-        quantity: parseInt(li.quantity, 10),
+      const base = li.unit_price != null ? parseFloat(li.unit_price) : NaN;
+
+      const result = {
+        variantId: variantGid,
+        quantity: qty
       };
 
-      // لو فيه price جاي من الكلاينت (بعد الخصم) نرسله كما هو
-      if (li.price != null) {
-        base.price = li.price.toString(); // Shopify expects String
+      // لو فيه unit_price صحيح → نرسله كـ originalUnitPrice
+      if (!isNaN(base)) {
+        result.originalUnitPrice = {
+          amount: base.toFixed(2),
+          currencyCode: SHOPIFY_CURRENCY
+        };
       }
 
-      return base;
+      return result;
     });
 
-    const shippingPriceNum = shipping_price ? parseFloat(shipping_price) : 0;
+    // 🧮 الشحن
+    const shipAmountNum = parseFloat(shipping_price || '0') || 0;
     const shippingLine =
-      shippingPriceNum > 0
+      shipAmountNum > 0
         ? {
             title: shipping_label || 'Shipping',
-            price: shippingPriceNum.toFixed(2),
+            price: {
+              amount: shipAmountNum.toFixed(2),
+              currencyCode: SHOPIFY_CURRENCY
+            }
           }
         : null;
 
-    const addr = address || {};
-    const mailingAddress = {
-      firstName: addr.firstName || '',
-      lastName: addr.lastName || '',
-      address1: addr.address1 || '',
-      city: addr.city || '',
-      zip: addr.zip || '',
-      country: addr.country || '',
-      phone: addr.phone || '',
+    // 🏠 عنوان الفاتورة والشحن
+    const firstName = address.firstName || '';
+    const lastName = address.lastName || '';
+    const mailAddr = {
+      firstName,
+      lastName,
+      address1: address.address1 || '',
+      city: address.city || '',
+      zip: address.zip || '',
+      country: address.country || '',
+      phone: address.phone || ''
     };
 
-    const email = addr.email || undefined;
+    const email = address.email || payload.email || '';
 
-    // 🧾 إنشاء Draft Order
-    const draftOrderInput = {
-      email,
-      billingAddress: mailingAddress,
-      shippingAddress: mailingAddress,
-      lineItems: lineItemsInput,
-      note: `PayPal order ${paypalOrderId || ''}${
-        paypalCaptureId ? ' | capture ' + paypalCaptureId : ''
-      }`,
-    };
-
-    if (shippingLine) {
-      draftOrderInput.shippingLine = shippingLine;
-    }
-
-    const DRAFT_ORDER_CREATE = `
+    // 🧾 ميوتشن إنشاء draftOrder
+    const draftCreateMutation = `
       mutation draftOrderCreate($input: DraftOrderInput!) {
         draftOrderCreate(input: $input) {
           draftOrder {
@@ -139,31 +133,38 @@ app.post('/api/shopify/order-from-paypal', async (req, res) => {
       }
     `;
 
-    const createData = await shopifyGraphQL(DRAFT_ORDER_CREATE, {
-      input: draftOrderInput,
-    });
+    const draftInput = {
+      lineItems: gqlLineItems,
+      shippingLine: shippingLine || undefined,
+      billingAddress: mailAddr,
+      shippingAddress: mailAddr,
+      email: email || undefined,
+      note: `PayPal order ${paypalOrderId || ''} | capture ${paypalCaptureId || ''}`,
+      customAttributes: [
+        { key: 'paypal_order_id', value: paypalOrderId || '' },
+        { key: 'paypal_capture_id', value: paypalCaptureId || '' }
+      ]
+    };
 
-    const createRes = createData.draftOrderCreate;
-    if (createRes.userErrors && createRes.userErrors.length > 0) {
-      console.error('Shopify draftOrderCreate userErrors:', createRes.userErrors);
-      return res.status(500).json({
-        ok: false,
-        error: 'Shopify draftOrderCreate userErrors',
-        details: createRes.userErrors,
-      });
+    const draftData = await shopifyGraphQL(draftCreateMutation, { input: draftInput });
+    const draftResult = draftData.draftOrderCreate;
+    if (draftResult.userErrors && draftResult.userErrors.length) {
+      console.error('❌ draftOrderCreate userErrors:', draftResult.userErrors);
+      return res.status(400).json({ ok: false, stage: 'draftOrderCreate', errors: draftResult.userErrors });
     }
 
-    const draftOrderId = createRes.draftOrder.id;
+    const draftId = draftResult.draftOrder.id;
+    console.log('✅ DraftOrder created:', draftId);
 
-    // ✅ إكمال الـ DraftOrder وتحويله إلى Order
-    const DRAFT_ORDER_COMPLETE = `
-      mutation draftOrderComplete($id: ID!, $paymentPending: Boolean!) {
+    // 🧾 ميوتشن إكمال الـ Draft (تحويله إلى Order مع Payment Pending = true)
+    const completeMutation = `
+      mutation draftOrderComplete($id: ID!, $paymentPending: Boolean) {
         draftOrderComplete(id: $id, paymentPending: $paymentPending) {
-          draftOrder {
+          order {
             id
-            order {
-              id
-              name
+            name
+            totalPriceSet {
+              shopMoney { amount currencyCode }
             }
           }
           userErrors {
@@ -174,42 +175,32 @@ app.post('/api/shopify/order-from-paypal', async (req, res) => {
       }
     `;
 
-    const completeData = await shopifyGraphQL(DRAFT_ORDER_COMPLETE, {
-      id: draftOrderId,
-      paymentPending: false, // الدفع تم فعليًا في PayPal
+    const completeData = await shopifyGraphQL(completeMutation, {
+      id: draftId,
+      paymentPending: true
     });
 
-    const completeRes = completeData.draftOrderComplete;
-    if (completeRes.userErrors && completeRes.userErrors.length > 0) {
-      console.error('Shopify draftOrderComplete userErrors:', completeRes.userErrors);
-      return res.status(500).json({
-        ok: false,
-        error: 'Shopify draftOrderComplete userErrors',
-        details: completeRes.userErrors,
-      });
+    const completeResult = completeData.draftOrderComplete;
+    if (completeResult.userErrors && completeResult.userErrors.length) {
+      console.error('❌ draftOrderComplete userErrors:', completeResult.userErrors);
+      return res.status(400).json({ ok: false, stage: 'draftOrderComplete', errors: completeResult.userErrors });
     }
 
-    const orderInfo = completeRes.draftOrder?.order || null;
+    console.log('✅ Order created:', completeResult.order);
 
     return res.json({
       ok: true,
-      order: orderInfo,
+      draftId,
+      order: completeResult.order
     });
   } catch (err) {
-    console.error('❌ Shopify Order Error:', err);
-    return res.status(500).json({ ok: false, error: err.message || 'Server error' });
+    console.error('💥 Server error in /api/shopify/order-from-paypal:', err);
+    return res.status(500).json({ ok: false, error: 'Server error' });
   }
 });
 
-// (اختياري) مسار قديم لـ /api/paypal/create-order لو لسه فيه كود قديم بيضربه
-app.post('/api/paypal/create-order', (req, res) => {
-  return res.status(400).json({
-    ok: false,
-    error: 'This endpoint is not used. Frontend uses client-side PayPal SDK.',
-  });
-});
-
+// 🚀 تشغيل السيرفر
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`🚀 Server listening on port ${PORT}`);
 });
